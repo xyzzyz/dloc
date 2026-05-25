@@ -187,7 +187,7 @@ impl UringBackend {
             self.submit_pending()?;
         }
         while pending_metadata > 0 {
-            self.submit_and_wait_one()?;
+            self.submit_and_wait_for(pending_metadata)?;
             for completion in self.drain_completions()? {
                 pending_metadata -= 1;
                 let Some(file) = pending_files
@@ -242,8 +242,6 @@ impl UringBackend {
                     }
                 }
             }
-
-            self.submit_pending()?;
         }
 
         let mut pending = 0;
@@ -331,8 +329,9 @@ impl UringBackend {
 
         self.submit_pending()?;
         while pending > 0 {
-            self.submit_and_wait_one()?;
+            self.submit_and_wait_for(pending)?;
             let completions = self.drain_completions()?;
+            let mut queued = false;
 
             for completion in completions {
                 pending -= 1;
@@ -353,6 +352,7 @@ impl UringBackend {
                                 CloseOutput::Emit(Err(io_error_for_item(&read.item, err))),
                             );
                             self.submit_close(completion.slot, read.fd)?;
+                            queued = true;
                             pending += 1;
                             continue;
                         }
@@ -367,6 +367,7 @@ impl UringBackend {
                                 ))),
                             );
                             self.submit_close(completion.slot, read.fd)?;
+                            queued = true;
                             pending += 1;
                             continue;
                         }
@@ -384,11 +385,13 @@ impl UringBackend {
                                 CloseOutput::Emit(output),
                             );
                             self.submit_close(completion.slot, read.fd)?;
+                            queued = true;
                             pending += 1;
                             continue;
                         }
 
                         self.submit_read(completion.slot, &mut read)?;
+                        queued = true;
                         reads[completion.slot] = Some(read);
                         pending += 1;
                     }
@@ -419,7 +422,9 @@ impl UringBackend {
                 }
             }
 
-            self.submit_pending()?;
+            if queued {
+                self.submit_pending()?;
+            }
         }
 
         for output in outputs {
@@ -506,9 +511,10 @@ impl UringBackend {
         }
     }
 
-    fn submit_and_wait_one(&self) -> Result<()> {
+    fn submit_and_wait_for(&self, pending: usize) -> Result<()> {
+        let wait_for = pending.min(IORING_COMPLETION_WAIT_BATCH).max(1);
         loop {
-            match self.ring.submit_and_wait(1) {
+            match self.ring.submit_and_wait(wait_for) {
                 Ok(_) => return Ok(()),
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
                 Err(err) => return Err(err.into()),
@@ -662,8 +668,9 @@ fn io_error_for_item(item: &SourceItem, source: io::Error) -> DlocError {
     }
 }
 
-const IORING_QUEUE_DEPTH: usize = 64;
+const IORING_QUEUE_DEPTH: usize = 128;
 const IORING_FILE_BATCH_SIZE: usize = IORING_QUEUE_DEPTH / 2;
+const IORING_COMPLETION_WAIT_BATCH: usize = IORING_FILE_BATCH_SIZE;
 const URING_OPERATION_BITS: u64 = 2;
 const URING_OPERATION_MASK: u64 = (1 << URING_OPERATION_BITS) - 1;
 
