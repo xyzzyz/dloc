@@ -44,6 +44,14 @@ impl BackendSelection {
             SelectedBackendKind::Uring => "io_uring",
         }
     }
+
+    pub fn io_worker_count(self, worker_count: usize, files_found: usize) -> usize {
+        let worker_count = match self.kind {
+            SelectedBackendKind::Pread => worker_count,
+            SelectedBackendKind::Uring => worker_count.min(max_uring_io_workers_for_fd_limit()),
+        };
+        worker_count.max(1).min(files_found.max(1))
+    }
 }
 
 pub fn create(kind: IoBackendKind) -> Result<Box<dyn ReadBackend>> {
@@ -244,186 +252,221 @@ impl UringBackend {
             }
         }
 
-        let mut pending = 0;
-        for file in pending_files {
-            let Some(mut file) = file else {
-                continue;
-            };
-            let slot = reads.len();
+        let mut next_file = 0;
+        while next_file < pending_files.len() {
+            let mut pending = 0;
+            let mut in_flight_bytes: usize = 0;
+            let mut group_files = 0;
+            reads.clear();
+            close_outputs.clear();
 
-            if let Some(err) = file.error.take() {
-                reads.push(None);
-                if let Some(fd) = file.fd.take() {
-                    set_close_output(&mut close_outputs, slot, CloseOutput::Emit(Err(err)));
+            while next_file < pending_files.len() && group_files < IORING_FILE_BATCH_SIZE {
+                let Some(mut file) = pending_files[next_file].take() else {
+                    next_file += 1;
+                    continue;
+                };
+                let slot = reads.len();
+
+                if let Some(err) = file.error.take() {
+                    reads.push(None);
+                    if let Some(fd) = file.fd.take() {
+                        set_close_output(&mut close_outputs, slot, CloseOutput::Emit(Err(err)));
+                        self.submit_close(slot, fd)?;
+                        pending += 1;
+                        group_files += 1;
+                    } else {
+                        outputs.push(Err(err));
+                    }
+                    next_file += 1;
+                    continue;
+                }
+
+                let Some(fd) = file.fd.take() else {
+                    reads.push(None);
+                    outputs.push(Err(DlocError::message(
+                        "io_uring open completed without a file descriptor",
+                    )));
+                    next_file += 1;
+                    continue;
+                };
+                if file.skip {
+                    reads.push(None);
+                    set_close_output(&mut close_outputs, slot, CloseOutput::Ignore);
                     self.submit_close(slot, fd)?;
                     pending += 1;
-                } else {
-                    outputs.push(Err(err));
+                    group_files += 1;
+                    next_file += 1;
+                    continue;
                 }
-                continue;
-            }
+                let Some(size) = file.size else {
+                    reads.push(None);
+                    set_close_output(
+                        &mut close_outputs,
+                        slot,
+                        CloseOutput::Emit(Err(DlocError::message(
+                            "io_uring statx completed without a size",
+                        ))),
+                    );
+                    self.submit_close(slot, fd)?;
+                    pending += 1;
+                    group_files += 1;
+                    next_file += 1;
+                    continue;
+                };
 
-            let Some(fd) = file.fd.take() else {
-                reads.push(None);
-                outputs.push(Err(DlocError::message(
-                    "io_uring open completed without a file descriptor",
-                )));
-                continue;
-            };
-            if file.skip {
-                reads.push(None);
-                set_close_output(&mut close_outputs, slot, CloseOutput::Ignore);
-                self.submit_close(slot, fd)?;
+                if size == 0 {
+                    reads.push(None);
+                    set_close_output(
+                        &mut close_outputs,
+                        slot,
+                        CloseOutput::Emit(Ok(ReadFile {
+                            item: file.item,
+                            bytes: Vec::new(),
+                        })),
+                    );
+                    self.submit_close(slot, fd)?;
+                    pending += 1;
+                    group_files += 1;
+                    next_file += 1;
+                    continue;
+                }
+
+                if group_files > 0
+                    && in_flight_bytes.saturating_add(size) > IORING_MAX_IN_FLIGHT_BYTES
+                {
+                    file.fd = Some(fd);
+                    pending_files[next_file] = Some(file);
+                    break;
+                }
+
+                let read = InFlightRead {
+                    item: file.item,
+                    fd,
+                    buffer: Vec::with_capacity(size),
+                    target_len: size,
+                    offset: 0,
+                };
+                reads.push(Some(read));
+                let slot = reads.len() - 1;
+                let mut read = reads[slot].take().expect("read was just inserted");
+                self.submit_read(slot, &mut read)?;
+                reads[slot] = Some(read);
+                in_flight_bytes = in_flight_bytes.saturating_add(size);
                 pending += 1;
-                continue;
+                group_files += 1;
+                next_file += 1;
             }
-            let Some(size) = file.size else {
-                reads.push(None);
-                set_close_output(
-                    &mut close_outputs,
-                    slot,
-                    CloseOutput::Emit(Err(DlocError::message(
-                        "io_uring statx completed without a size",
-                    ))),
-                );
-                self.submit_close(slot, fd)?;
-                pending += 1;
-                continue;
-            };
 
-            if size == 0 {
-                reads.push(None);
-                set_close_output(
-                    &mut close_outputs,
-                    slot,
-                    CloseOutput::Emit(Ok(ReadFile {
-                        item: file.item,
-                        bytes: Vec::new(),
-                    })),
-                );
-                self.submit_close(slot, fd)?;
-                pending += 1;
+            if pending == 0 {
                 continue;
             }
 
-            let read = InFlightRead {
-                item: file.item,
-                fd,
-                buffer: vec![0; size],
-                offset: 0,
-            };
-            reads.push(Some(read));
-            let slot = reads.len() - 1;
-            let mut read = reads[slot].take().expect("read was just inserted");
-            self.submit_read(slot, &mut read)?;
-            reads[slot] = Some(read);
-            pending += 1;
-        }
+            self.submit_pending()?;
+            while pending > 0 {
+                self.submit_and_wait_for(pending)?;
+                let completions = self.drain_completions()?;
+                let mut queued = false;
 
-        if pending == 0 {
-            for output in outputs {
-                emit(output);
-            }
-            return Ok(());
-        }
+                for completion in completions {
+                    pending -= 1;
+                    match completion.operation {
+                        UringOperation::Read => {
+                            let Some(mut read) =
+                                reads.get_mut(completion.slot).and_then(Option::take)
+                            else {
+                                return Err(DlocError::message(
+                                    "io_uring returned an unknown read completion",
+                                ));
+                            };
 
-        self.submit_pending()?;
-        while pending > 0 {
-            self.submit_and_wait_for(pending)?;
-            let completions = self.drain_completions()?;
-            let mut queued = false;
+                            if completion.result < 0 {
+                                let err = io::Error::from_raw_os_error(-completion.result);
+                                set_close_output(
+                                    &mut close_outputs,
+                                    completion.slot,
+                                    CloseOutput::Emit(Err(io_error_for_item(&read.item, err))),
+                                );
+                                self.submit_close(completion.slot, read.fd)?;
+                                queued = true;
+                                pending += 1;
+                                continue;
+                            }
 
-            for completion in completions {
-                pending -= 1;
-                match completion.operation {
-                    UringOperation::Read => {
-                        let Some(mut read) = reads.get_mut(completion.slot).and_then(Option::take)
-                        else {
+                            let bytes_read = completion.result as usize;
+                            if bytes_read > read.target_len - read.offset {
+                                set_close_output(
+                                    &mut close_outputs,
+                                    completion.slot,
+                                    CloseOutput::Emit(Err(DlocError::message(
+                                        "io_uring completed more bytes than requested",
+                                    ))),
+                                );
+                                self.submit_close(completion.slot, read.fd)?;
+                                queued = true;
+                                pending += 1;
+                                continue;
+                            }
+
+                            read.offset += bytes_read;
+                            if bytes_read == 0 || read.offset == read.target_len {
+                                // The kernel initialized exactly the bytes it reported.
+                                unsafe {
+                                    read.buffer.set_len(read.offset);
+                                }
+                                let output = Ok(ReadFile {
+                                    item: read.item,
+                                    bytes: read.buffer,
+                                });
+                                set_close_output(
+                                    &mut close_outputs,
+                                    completion.slot,
+                                    CloseOutput::Emit(output),
+                                );
+                                self.submit_close(completion.slot, read.fd)?;
+                                queued = true;
+                                pending += 1;
+                                continue;
+                            }
+
+                            self.submit_read(completion.slot, &mut read)?;
+                            queued = true;
+                            reads[completion.slot] = Some(read);
+                            pending += 1;
+                        }
+                        UringOperation::Close => {
+                            let output = close_outputs
+                                .get_mut(completion.slot)
+                                .and_then(Option::take)
+                                .ok_or_else(|| {
+                                    DlocError::message(
+                                        "io_uring returned an unknown close completion",
+                                    )
+                                })?;
+                            match output {
+                                CloseOutput::Ignore => {}
+                                CloseOutput::Emit(output) if completion.result < 0 => {
+                                    match output {
+                                        Ok(read_file) => outputs.push(Err(io_error_for_item(
+                                            &read_file.item,
+                                            io::Error::from_raw_os_error(-completion.result),
+                                        ))),
+                                        Err(err) => outputs.push(Err(err)),
+                                    }
+                                }
+                                CloseOutput::Emit(output) => outputs.push(output),
+                            }
+                        }
+                        UringOperation::Open | UringOperation::Statx => {
                             return Err(DlocError::message(
-                                "io_uring returned an unknown read completion",
+                                "io_uring returned a metadata completion during reads",
                             ));
-                        };
-
-                        if completion.result < 0 {
-                            let err = io::Error::from_raw_os_error(-completion.result);
-                            set_close_output(
-                                &mut close_outputs,
-                                completion.slot,
-                                CloseOutput::Emit(Err(io_error_for_item(&read.item, err))),
-                            );
-                            self.submit_close(completion.slot, read.fd)?;
-                            queued = true;
-                            pending += 1;
-                            continue;
                         }
-
-                        let bytes_read = completion.result as usize;
-                        if bytes_read > read.buffer.len() - read.offset {
-                            set_close_output(
-                                &mut close_outputs,
-                                completion.slot,
-                                CloseOutput::Emit(Err(DlocError::message(
-                                    "io_uring completed more bytes than requested",
-                                ))),
-                            );
-                            self.submit_close(completion.slot, read.fd)?;
-                            queued = true;
-                            pending += 1;
-                            continue;
-                        }
-
-                        read.offset += bytes_read;
-                        if bytes_read == 0 || read.offset == read.buffer.len() {
-                            read.buffer.truncate(read.offset);
-                            let output = Ok(ReadFile {
-                                item: read.item,
-                                bytes: read.buffer,
-                            });
-                            set_close_output(
-                                &mut close_outputs,
-                                completion.slot,
-                                CloseOutput::Emit(output),
-                            );
-                            self.submit_close(completion.slot, read.fd)?;
-                            queued = true;
-                            pending += 1;
-                            continue;
-                        }
-
-                        self.submit_read(completion.slot, &mut read)?;
-                        queued = true;
-                        reads[completion.slot] = Some(read);
-                        pending += 1;
-                    }
-                    UringOperation::Close => {
-                        let output = close_outputs
-                            .get_mut(completion.slot)
-                            .and_then(Option::take)
-                            .ok_or_else(|| {
-                                DlocError::message("io_uring returned an unknown close completion")
-                            })?;
-                        match output {
-                            CloseOutput::Ignore => {}
-                            CloseOutput::Emit(output) if completion.result < 0 => match output {
-                                Ok(read_file) => outputs.push(Err(io_error_for_item(
-                                    &read_file.item,
-                                    io::Error::from_raw_os_error(-completion.result),
-                                ))),
-                                Err(err) => outputs.push(Err(err)),
-                            },
-                            CloseOutput::Emit(output) => outputs.push(output),
-                        }
-                    }
-                    UringOperation::Open | UringOperation::Statx => {
-                        return Err(DlocError::message(
-                            "io_uring returned a metadata completion during reads",
-                        ));
                     }
                 }
-            }
 
-            if queued {
-                self.submit_pending()?;
+                if queued {
+                    self.submit_pending()?;
+                }
             }
         }
 
@@ -455,15 +498,14 @@ impl UringBackend {
     }
 
     fn submit_read(&mut self, slot: usize, read: &mut InFlightRead) -> Result<()> {
-        let len = (read.buffer.len() - read.offset).min(u32::MAX as usize) as u32;
-        let entry = opcode::Read::new(
-            types::Fd(read.fd),
-            read.buffer[read.offset..].as_mut_ptr(),
-            len,
-        )
-        .offset(read.offset as u64)
-        .build()
-        .user_data(encode_user_data(slot, UringOperation::Read));
+        let len = (read.target_len - read.offset).min(u32::MAX as usize) as u32;
+        // The vector length stays zero until completion; the spare capacity is
+        // valid for the kernel to initialize.
+        let buffer = unsafe { read.buffer.as_mut_ptr().add(read.offset) };
+        let entry = opcode::Read::new(types::Fd(read.fd), buffer, len)
+            .offset(read.offset as u64)
+            .build()
+            .user_data(encode_user_data(slot, UringOperation::Read));
 
         self.push_entry(entry)
     }
@@ -565,6 +607,7 @@ struct InFlightRead {
     item: SourceItem,
     fd: RawFd,
     buffer: Vec<u8>,
+    target_len: usize,
     offset: usize,
 }
 
@@ -668,9 +711,32 @@ fn io_error_for_item(item: &SourceItem, source: io::Error) -> DlocError {
     }
 }
 
+fn max_uring_io_workers_for_fd_limit() -> usize {
+    let mut limit = MaybeUninit::<libc::rlimit>::uninit();
+    let max_workers = unsafe {
+        if libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) != 0 {
+            return MAX_URING_IO_WORKERS;
+        }
+        let limit = limit.assume_init();
+        if limit.rlim_cur == libc::RLIM_INFINITY {
+            return MAX_URING_IO_WORKERS;
+        }
+        usize::try_from(limit.rlim_cur).unwrap_or(usize::MAX)
+    };
+
+    max_workers
+        .saturating_sub(URING_FD_RESERVE)
+        .checked_div(IORING_FILE_BATCH_SIZE)
+        .unwrap_or(0)
+        .clamp(1, MAX_URING_IO_WORKERS)
+}
+
 const IORING_QUEUE_DEPTH: usize = 128;
 const IORING_FILE_BATCH_SIZE: usize = IORING_QUEUE_DEPTH / 2;
 const IORING_COMPLETION_WAIT_BATCH: usize = IORING_FILE_BATCH_SIZE;
+const IORING_MAX_IN_FLIGHT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_URING_IO_WORKERS: usize = 2;
+const URING_FD_RESERVE: usize = 128;
 const URING_OPERATION_BITS: u64 = 2;
 const URING_OPERATION_MASK: u64 = (1 << URING_OPERATION_BITS) - 1;
 
