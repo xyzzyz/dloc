@@ -7,11 +7,7 @@ use std::path::PathBuf;
 use std::thread;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "dloc",
-    version,
-    about = "Fast line-of-code counter."
-)]
+#[command(name = "dloc", version, about = "Fast line-of-code counter.")]
 pub struct Args {
     #[arg(value_name = "FILE|DIR", required = true)]
     inputs: Vec<PathBuf>,
@@ -114,7 +110,10 @@ impl From<IoBackendArg> for IoBackendKind {
 }
 
 fn compile_optional_regex(pattern: Option<String>) -> Result<Option<Regex>> {
-    pattern.map(|pattern| Regex::new(&pattern)).transpose().map_err(Into::into)
+    pattern
+        .map(|pattern| Regex::new(&pattern))
+        .transpose()
+        .map_err(Into::into)
 }
 
 fn parse_csv_set(value: Option<String>) -> BTreeSet<String> {

@@ -1,6 +1,6 @@
+use crate::Result;
 use crate::config::IoBackendKind;
 use crate::source::SourceMeta;
-use crate::Result;
 
 pub trait ReadBackend: Send {
     fn name(&self) -> &'static str;
