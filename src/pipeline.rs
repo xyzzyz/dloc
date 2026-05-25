@@ -33,9 +33,7 @@ pub fn run(
     sources: Vec<SourceItem>,
 ) -> Result<PipelineOutput> {
     let files_found = sources.len();
-    let backend = io_backend::create(config.io_backend)?;
-    let backend_name = backend.name().to_string();
-    drop(backend);
+    let backend_name = io_backend::name(config.io_backend)?.to_string();
 
     if sources.is_empty() {
         return Ok(PipelineOutput {
@@ -48,7 +46,9 @@ pub fn run(
     }
 
     let worker_count = config.threads.max(1);
-    let channel_bound = (worker_count * 4).max(4);
+    // Keep bounded queues large enough to absorb short producer/consumer bursts
+    // without letting large trees allocate one queued item per file.
+    let channel_bound = (worker_count * CHANNEL_DEPTH_PER_WORKER).max(MIN_CHANNEL_BOUND);
     let (request_tx, request_rx) = bounded::<ReadRequest>(channel_bound);
     let (read_tx, read_rx) = bounded::<Result<ReadFile>>(channel_bound);
     let (count_tx, count_rx) = bounded::<Result<Option<CountedFile>>>(channel_bound);
@@ -271,6 +271,8 @@ fn is_binary(bytes: &[u8]) -> bool {
 }
 
 const READ_BATCH_SIZE: usize = 32;
+const CHANNEL_DEPTH_PER_WORKER: usize = 4;
+const MIN_CHANNEL_BOUND: usize = 4;
 
 #[derive(Debug)]
 struct CountedFile {

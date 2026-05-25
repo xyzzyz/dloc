@@ -34,6 +34,15 @@ pub fn create(kind: IoBackendKind) -> Result<Box<dyn ReadBackend>> {
     }
 }
 
+pub fn name(kind: IoBackendKind) -> Result<&'static str> {
+    match kind {
+        IoBackendKind::Auto | IoBackendKind::Pread => Ok("pread"),
+        IoBackendKind::Uring => Err(DlocError::message(
+            "io_uring backend is not implemented yet; use --io-backend=auto or pread",
+        )),
+    }
+}
+
 #[derive(Debug)]
 struct PreadBackend;
 
