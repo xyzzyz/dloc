@@ -141,6 +141,7 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "io-uring",
+ "libc",
  "regex",
  "serde",
  "serde_json",
