@@ -57,7 +57,7 @@ pub fn run(
     let registry = Arc::new(registry.clone());
     let io_workers = worker_count.min(files_found.max(1));
     let cpu_workers = worker_count;
-    let mut handles = Vec::with_capacity(io_workers + cpu_workers);
+    let mut handles = Vec::with_capacity(1 + io_workers + cpu_workers);
 
     for _ in 0..io_workers {
         let request_rx = request_rx.clone();
@@ -80,12 +80,14 @@ pub fn run(
     }
     drop(count_tx);
 
-    for item in sources {
-        request_tx
-            .send(ReadRequest { item })
-            .map_err(|_| crate::DlocError::message("read request channel closed"))?;
-    }
-    drop(request_tx);
+    handles.push(thread::spawn(move || {
+        for item in sources {
+            request_tx
+                .send(ReadRequest { item })
+                .map_err(|_| crate::DlocError::message("read request channel closed"))?;
+        }
+        Ok(())
+    }));
 
     let (languages, mut files, first_error) = reduce_counts(count_rx);
 
@@ -386,5 +388,37 @@ mod tests {
 
         fs::remove_dir_all(root_a).unwrap();
         fs::remove_dir_all(root_b).unwrap();
+    }
+
+    #[test]
+    fn handles_more_sources_than_channel_bound() {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("dloc-pipeline-many-test-{id}"));
+        fs::create_dir_all(&root).unwrap();
+
+        let mut sources = Vec::new();
+        for index in 0..64 {
+            let name = format!("file-{index}.rs");
+            let path = root.join(&name);
+            fs::write(&path, "fn f() {}\n").unwrap();
+            sources.push(SourceItem {
+                logical_path: name,
+                size: 10,
+                source: SourceRef::Path(path),
+            });
+        }
+
+        let mut config = test_config();
+        config.threads = 1;
+        let output = run(&config, &LanguageRegistry::new(), sources).unwrap();
+
+        assert_eq!(output.files_found, 64);
+        assert_eq!(output.files_counted, 64);
+        assert_eq!(output.languages.get("Rust").unwrap().files, 64);
+
+        fs::remove_dir_all(root).unwrap();
     }
 }
