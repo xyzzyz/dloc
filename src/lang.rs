@@ -28,7 +28,7 @@ pub struct Language {
     pub syntax: CommentSyntax,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct LanguageRegistry {
     languages: &'static [Language],
 }
