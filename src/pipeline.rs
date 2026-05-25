@@ -48,18 +48,18 @@ pub fn run(
     let backend_name = backend_selection.name().to_string();
 
     let worker_count = config.threads.max(1);
+    let io_workers = backend_selection.io_worker_count(worker_count, files_found);
+    let cpu_workers = worker_count;
     // Give IO workers enough queued paths to form full read batches while keeping
     // read-result buffers under tighter backpressure.
-    let request_channel_bound = request_channel_bound(worker_count);
-    let result_channel_bound = result_channel_bound(worker_count);
+    let request_channel_bound = request_channel_bound(io_workers);
+    let result_channel_bound = result_channel_bound(cpu_workers);
     let (request_tx, request_rx) = bounded::<ReadRequest>(request_channel_bound);
     let (read_tx, read_rx) = bounded::<Result<ReadFile>>(result_channel_bound);
     let (count_tx, count_rx) = bounded::<Result<Option<CountedFile>>>(result_channel_bound);
 
     let config = Arc::new(config.clone());
     let registry = Arc::new(registry.clone());
-    let io_workers = worker_count.min(files_found.max(1));
-    let cpu_workers = worker_count;
     let mut handles = Vec::with_capacity(1 + io_workers + cpu_workers);
 
     for _ in 0..io_workers {
