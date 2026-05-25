@@ -1,4 +1,5 @@
 use crate::config::{Config, IoBackendKind};
+use crate::lang::normalize_language_name;
 use crate::{DlocError, Result};
 use clap::{Parser, ValueEnum};
 use regex::Regex;
@@ -89,8 +90,8 @@ impl TryFrom<Args> for Config {
             max_file_size_bytes: args.max_file_size.saturating_mul(1024 * 1024),
             include_ext: parse_csv_set(args.include_ext),
             exclude_ext: parse_csv_set(args.exclude_ext),
-            include_lang: parse_csv_set(args.include_lang),
-            exclude_lang: parse_csv_set(args.exclude_lang),
+            include_lang: parse_lang_set(args.include_lang),
+            exclude_lang: parse_lang_set(args.exclude_lang),
             include_content: compile_optional_regex(args.include_content)?,
             exclude_content: compile_optional_regex(args.exclude_content)?,
             skip_uniqueness: args.skip_uniqueness,
@@ -123,6 +124,19 @@ fn parse_csv_set(value: Option<String>) -> BTreeSet<String> {
             value
                 .split(',')
                 .map(|item| item.trim().trim_start_matches('.').to_ascii_lowercase())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn parse_lang_set(value: Option<String>) -> BTreeSet<String> {
+    value
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(|item| normalize_language_name(item.trim()))
                 .filter(|item| !item.is_empty())
                 .collect::<Vec<_>>()
         })
