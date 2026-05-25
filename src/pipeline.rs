@@ -48,12 +48,13 @@ pub fn run(
     let backend_name = backend_selection.name().to_string();
 
     let worker_count = config.threads.max(1);
-    // Keep bounded queues large enough to absorb short producer/consumer bursts
-    // without letting large trees allocate one queued item per file.
-    let channel_bound = (worker_count * CHANNEL_DEPTH_PER_WORKER).max(MIN_CHANNEL_BOUND);
-    let (request_tx, request_rx) = bounded::<ReadRequest>(channel_bound);
-    let (read_tx, read_rx) = bounded::<Result<ReadFile>>(channel_bound);
-    let (count_tx, count_rx) = bounded::<Result<Option<CountedFile>>>(channel_bound);
+    // Give IO workers enough queued paths to form full read batches while keeping
+    // read-result buffers under tighter backpressure.
+    let request_channel_bound = request_channel_bound(worker_count);
+    let result_channel_bound = result_channel_bound(worker_count);
+    let (request_tx, request_rx) = bounded::<ReadRequest>(request_channel_bound);
+    let (read_tx, read_rx) = bounded::<Result<ReadFile>>(result_channel_bound);
+    let (count_tx, count_rx) = bounded::<Result<Option<CountedFile>>>(result_channel_bound);
 
     let config = Arc::new(config.clone());
     let registry = Arc::new(registry.clone());
@@ -271,8 +272,22 @@ fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|byte| *byte == 0)
 }
 
-const READ_BATCH_SIZE: usize = 32;
-const CHANNEL_DEPTH_PER_WORKER: usize = 4;
+fn request_channel_bound(worker_count: usize) -> usize {
+    worker_count
+        .saturating_mul(READ_BATCH_SIZE)
+        .saturating_mul(REQUEST_BATCHES_PER_WORKER)
+        .max(MIN_CHANNEL_BOUND)
+}
+
+fn result_channel_bound(worker_count: usize) -> usize {
+    worker_count
+        .saturating_mul(RESULT_CHANNEL_DEPTH_PER_WORKER)
+        .max(MIN_CHANNEL_BOUND)
+}
+
+const READ_BATCH_SIZE: usize = 64;
+const REQUEST_BATCHES_PER_WORKER: usize = 2;
+const RESULT_CHANNEL_DEPTH_PER_WORKER: usize = 4;
 const MIN_CHANNEL_BOUND: usize = 4;
 
 #[derive(Debug)]
@@ -403,7 +418,8 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         let mut sources = Vec::new();
-        for index in 0..64 {
+        let source_count = request_channel_bound(1) + 16;
+        for index in 0..source_count {
             let name = format!("file-{index}.rs");
             let path = root.join(&name);
             fs::write(&path, "fn f() {}\n").unwrap();
@@ -418,9 +434,12 @@ mod tests {
         config.threads = 1;
         let output = run(&config, &LanguageRegistry::new(), sources).unwrap();
 
-        assert_eq!(output.files_found, 64);
-        assert_eq!(output.files_counted, 64);
-        assert_eq!(output.languages.get("Rust").unwrap().files, 64);
+        assert_eq!(output.files_found, source_count);
+        assert_eq!(output.files_counted, source_count);
+        assert_eq!(
+            output.languages.get("Rust").unwrap().files,
+            source_count as u64
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
