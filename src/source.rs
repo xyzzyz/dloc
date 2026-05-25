@@ -2,13 +2,13 @@ use crate::Result;
 use crate::config::Config;
 use crate::error::DlocError;
 use std::collections::BTreeSet;
-use std::fs::{self, Metadata};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SourceItem {
     pub logical_path: String,
-    pub size: u64,
+    pub max_size_bytes: Option<u64>,
     pub source: SourceRef,
 }
 
@@ -64,7 +64,7 @@ impl FileSystemProvider {
         }
 
         if metadata.is_file() {
-            self.add_file(path, config, explicit, &metadata, sources);
+            self.add_file(path, config, explicit, sources);
         }
 
         Ok(())
@@ -81,7 +81,7 @@ impl FileSystemProvider {
         let metadata = fs::metadata(path).map_err(|err| DlocError::io_path(path, err))?;
 
         if metadata.is_file() {
-            self.add_file(path, config, explicit, &metadata, sources);
+            self.add_file(path, config, explicit, sources);
         } else if metadata.is_dir() && config.follow_links {
             self.visit_dir(path, config, visited_dirs, sources)?;
         }
@@ -125,26 +125,27 @@ impl FileSystemProvider {
                 continue;
             }
 
-            let metadata = fs::symlink_metadata(&entry_path)
+            let file_type = entry
+                .file_type()
                 .map_err(|err| DlocError::io_path(&entry_path, err))?;
 
-            if metadata.file_type().is_symlink() {
+            if file_type.is_symlink() {
                 let target = fs::metadata(&entry_path)
                     .map_err(|err| DlocError::io_path(&entry_path, err))?;
                 if target.is_file() {
-                    self.add_file(&entry_path, config, false, &target, sources);
+                    self.add_file(&entry_path, config, false, sources);
                 } else if target.is_dir() && config.follow_links && !config.no_recurse {
                     self.visit_dir(&entry_path, config, visited_dirs, sources)?;
                 }
                 continue;
             }
 
-            if metadata.is_dir() {
+            if file_type.is_dir() {
                 if !config.no_recurse {
                     self.visit_dir(&entry_path, config, visited_dirs, sources)?;
                 }
-            } else if metadata.is_file() {
-                self.add_file(&entry_path, config, false, &metadata, sources);
+            } else if file_type.is_file() {
+                self.add_file(&entry_path, config, false, sources);
             }
         }
 
@@ -156,13 +157,8 @@ impl FileSystemProvider {
         path: &Path,
         config: &Config,
         explicit: bool,
-        metadata: &Metadata,
         sources: &mut Vec<SourceItem>,
     ) {
-        if !explicit && metadata.len() > config.max_file_size_bytes {
-            return;
-        }
-
         if !matches_extension_filter(path, &config.include_ext, true) {
             return;
         }
@@ -173,7 +169,7 @@ impl FileSystemProvider {
 
         sources.push(SourceItem {
             logical_path: path.to_string_lossy().into_owned(),
-            size: metadata.len(),
+            max_size_bytes: (!explicit).then_some(config.max_file_size_bytes),
             source: SourceRef::Path(path.to_path_buf()),
         });
     }
@@ -270,6 +266,39 @@ mod tests {
 
         assert_eq!(sources.len(), 1);
         assert!(sources[0].logical_path.ends_with("keep.rs"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn marks_non_explicit_files_with_size_limit() {
+        let root = temp_tree();
+        fs::write(root.join("lib.rs"), "fn main() {}\n").unwrap();
+
+        let mut config = test_config(root.clone());
+        config.max_file_size_bytes = 8;
+
+        let sources = FileSystemProvider::new().enumerate(&config).unwrap();
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].max_size_bytes, Some(8));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn leaves_explicit_files_without_size_limit() {
+        let root = temp_tree();
+        let path = root.join("large.rs");
+        fs::write(&path, "fn main() {}\n").unwrap();
+
+        let mut config = test_config(path);
+        config.max_file_size_bytes = 1;
+
+        let sources = FileSystemProvider::new().enumerate(&config).unwrap();
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].max_size_bytes, None);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -115,6 +115,13 @@ impl ReadBackend for PreadBackend {
     ) -> Result<()> {
         for request in requests {
             let SourceRef::Path(path) = &request.item.source;
+            if let Some(max_size_bytes) = request.item.max_size_bytes {
+                let metadata = fs::metadata(path).map_err(|err| DlocError::io_path(path, err))?;
+                if metadata.len() > max_size_bytes {
+                    continue;
+                }
+            }
+
             let bytes = fs::read(path).map_err(|err| DlocError::io_path(path, err));
             emit(bytes.map(|bytes| ReadFile {
                 item: request.item,
@@ -164,6 +171,7 @@ impl UringBackend {
                 statx: Box::new(MaybeUninit::uninit()),
                 fd: None,
                 size: None,
+                skip: false,
                 error: None,
             };
             pending_files.push(Some(file));
@@ -216,7 +224,13 @@ impl UringBackend {
                             );
                         } else {
                             match statx_size(&file.item, &file.statx) {
-                                Ok(size) => file.size = Some(size),
+                                Ok(size) => {
+                                    if exceeds_size_limit(&file.item, size) {
+                                        file.skip = true;
+                                    } else {
+                                        file.size = Some(size);
+                                    }
+                                }
                                 Err(err) => set_first_error(&mut file.error, err),
                             }
                         }
@@ -242,7 +256,7 @@ impl UringBackend {
             if let Some(err) = file.error.take() {
                 reads.push(None);
                 if let Some(fd) = file.fd.take() {
-                    set_close_output(&mut close_outputs, slot, Err(err));
+                    set_close_output(&mut close_outputs, slot, CloseOutput::Emit(Err(err)));
                     self.submit_close(slot, fd)?;
                     pending += 1;
                 } else {
@@ -258,14 +272,21 @@ impl UringBackend {
                 )));
                 continue;
             };
+            if file.skip {
+                reads.push(None);
+                set_close_output(&mut close_outputs, slot, CloseOutput::Ignore);
+                self.submit_close(slot, fd)?;
+                pending += 1;
+                continue;
+            }
             let Some(size) = file.size else {
                 reads.push(None);
                 set_close_output(
                     &mut close_outputs,
                     slot,
-                    Err(DlocError::message(
+                    CloseOutput::Emit(Err(DlocError::message(
                         "io_uring statx completed without a size",
-                    )),
+                    ))),
                 );
                 self.submit_close(slot, fd)?;
                 pending += 1;
@@ -277,10 +298,10 @@ impl UringBackend {
                 set_close_output(
                     &mut close_outputs,
                     slot,
-                    Ok(ReadFile {
+                    CloseOutput::Emit(Ok(ReadFile {
                         item: file.item,
                         bytes: Vec::new(),
-                    }),
+                    })),
                 );
                 self.submit_close(slot, fd)?;
                 pending += 1;
@@ -329,7 +350,7 @@ impl UringBackend {
                             set_close_output(
                                 &mut close_outputs,
                                 completion.slot,
-                                Err(io_error_for_item(&read.item, err)),
+                                CloseOutput::Emit(Err(io_error_for_item(&read.item, err))),
                             );
                             self.submit_close(completion.slot, read.fd)?;
                             pending += 1;
@@ -341,9 +362,9 @@ impl UringBackend {
                             set_close_output(
                                 &mut close_outputs,
                                 completion.slot,
-                                Err(DlocError::message(
+                                CloseOutput::Emit(Err(DlocError::message(
                                     "io_uring completed more bytes than requested",
-                                )),
+                                ))),
                             );
                             self.submit_close(completion.slot, read.fd)?;
                             pending += 1;
@@ -357,7 +378,11 @@ impl UringBackend {
                                 item: read.item,
                                 bytes: read.buffer,
                             });
-                            set_close_output(&mut close_outputs, completion.slot, output);
+                            set_close_output(
+                                &mut close_outputs,
+                                completion.slot,
+                                CloseOutput::Emit(output),
+                            );
                             self.submit_close(completion.slot, read.fd)?;
                             pending += 1;
                             continue;
@@ -374,16 +399,16 @@ impl UringBackend {
                             .ok_or_else(|| {
                                 DlocError::message("io_uring returned an unknown close completion")
                             })?;
-                        if completion.result < 0 {
-                            match output {
+                        match output {
+                            CloseOutput::Ignore => {}
+                            CloseOutput::Emit(output) if completion.result < 0 => match output {
                                 Ok(read_file) => outputs.push(Err(io_error_for_item(
                                     &read_file.item,
                                     io::Error::from_raw_os_error(-completion.result),
                                 ))),
                                 Err(err) => outputs.push(Err(err)),
-                            }
-                        } else {
-                            outputs.push(output);
+                            },
+                            CloseOutput::Emit(output) => outputs.push(output),
                         }
                     }
                     UringOperation::Open | UringOperation::Statx => {
@@ -525,6 +550,7 @@ struct PendingFile {
     statx: Box<MaybeUninit<libc::statx>>,
     fd: Option<RawFd>,
     size: Option<usize>,
+    skip: bool,
     error: Option<DlocError>,
 }
 
@@ -541,6 +567,12 @@ struct UringCompletion {
     slot: usize,
     operation: UringOperation,
     result: i32,
+}
+
+#[derive(Debug)]
+enum CloseOutput {
+    Emit(Result<ReadFile>),
+    Ignore,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -582,6 +614,11 @@ fn statx_size(item: &SourceItem, statx: &MaybeUninit<libc::statx>) -> Result<usi
     })
 }
 
+fn exceeds_size_limit(item: &SourceItem, size: usize) -> bool {
+    item.max_size_bytes
+        .is_some_and(|max_size_bytes| size as u64 > max_size_bytes)
+}
+
 fn set_first_error(error: &mut Option<DlocError>, new_error: DlocError) {
     if error.is_none() {
         *error = Some(new_error);
@@ -589,9 +626,9 @@ fn set_first_error(error: &mut Option<DlocError>, new_error: DlocError) {
 }
 
 fn set_close_output(
-    close_outputs: &mut Vec<Option<Result<ReadFile>>>,
+    close_outputs: &mut Vec<Option<CloseOutput>>,
     slot: usize,
-    output: Result<ReadFile>,
+    output: CloseOutput,
 ) {
     if close_outputs.len() <= slot {
         close_outputs.resize_with(slot + 1, || None);
@@ -637,7 +674,12 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_source(prefix: &str, logical_path: &str, contents: &str) -> (PathBuf, ReadRequest) {
+    fn temp_source(
+        prefix: &str,
+        logical_path: &str,
+        contents: &str,
+        max_size_bytes: Option<u64>,
+    ) -> (PathBuf, ReadRequest) {
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -650,15 +692,24 @@ mod tests {
         let request = ReadRequest {
             item: SourceItem {
                 logical_path: logical_path.to_string(),
-                size: contents.len() as u64,
+                max_size_bytes,
                 source: SourceRef::Path(path),
             },
         };
         (root, request)
     }
 
-    fn read_one(kind: IoBackendKind, contents: &str) -> Option<(PathBuf, Vec<ReadFile>)> {
-        let (root, request) = temp_source("dloc-read-backend-test", "src/lib.rs", contents);
+    fn read_one(
+        kind: IoBackendKind,
+        contents: &str,
+        max_size_bytes: Option<u64>,
+    ) -> Option<(PathBuf, Vec<ReadFile>)> {
+        let (root, request) = temp_source(
+            "dloc-read-backend-test",
+            "src/lib.rs",
+            contents,
+            max_size_bytes,
+        );
         let mut backend = match create(kind) {
             Ok(backend) => backend,
             Err(_) if kind == IoBackendKind::Uring => return None,
@@ -674,7 +725,7 @@ mod tests {
 
     #[test]
     fn pread_read_many_emits_files() {
-        let (root, emitted) = read_one(IoBackendKind::Pread, "fn main() {}\n").unwrap();
+        let (root, emitted) = read_one(IoBackendKind::Pread, "fn main() {}\n", None).unwrap();
 
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].item.logical_path, "src/lib.rs");
@@ -685,7 +736,7 @@ mod tests {
 
     #[test]
     fn auto_read_many_emits_files() {
-        let (root, emitted) = read_one(IoBackendKind::Auto, "fn main() {}\n").unwrap();
+        let (root, emitted) = read_one(IoBackendKind::Auto, "fn main() {}\n", None).unwrap();
 
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].bytes, b"fn main() {}\n");
@@ -695,7 +746,7 @@ mod tests {
 
     #[test]
     fn uring_read_many_emits_files_when_available() {
-        let Some((root, emitted)) = read_one(IoBackendKind::Uring, "fn main() {}\n") else {
+        let Some((root, emitted)) = read_one(IoBackendKind::Uring, "fn main() {}\n", None) else {
             return;
         };
 
@@ -707,12 +758,33 @@ mod tests {
 
     #[test]
     fn uring_read_many_emits_empty_files_when_available() {
-        let Some((root, emitted)) = read_one(IoBackendKind::Uring, "") else {
+        let Some((root, emitted)) = read_one(IoBackendKind::Uring, "", None) else {
             return;
         };
 
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].bytes, b"");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pread_skips_files_over_size_limit() {
+        let (root, emitted) = read_one(IoBackendKind::Pread, "fn main() {}\n", Some(1)).unwrap();
+
+        assert!(emitted.is_empty());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn uring_skips_files_over_size_limit_when_available() {
+        let Some((root, emitted)) = read_one(IoBackendKind::Uring, "fn main() {}\n", Some(1))
+        else {
+            return;
+        };
+
+        assert!(emitted.is_empty());
 
         fs::remove_dir_all(root).unwrap();
     }
