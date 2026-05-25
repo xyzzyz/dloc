@@ -311,7 +311,7 @@ mod tests {
         fs::write(&path, contents).unwrap();
         let source = SourceItem {
             logical_path: logical_path.to_string(),
-            size: contents.len() as u64,
+            max_size_bytes: None,
             source: SourceRef::Path(path),
         };
         (root, source)
@@ -409,7 +409,7 @@ mod tests {
             fs::write(&path, "fn f() {}\n").unwrap();
             sources.push(SourceItem {
                 logical_path: name,
-                size: 10,
+                max_size_bytes: None,
                 source: SourceRef::Path(path),
             });
         }
