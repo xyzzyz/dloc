@@ -1,11 +1,12 @@
 use crate::Result;
 use crate::config::Config;
 use crate::count::{CounterSet, LineCounts};
-use crate::io_backend;
+use crate::io_backend::{self, ReadFile, ReadRequest};
 use crate::lang::LanguageRegistry;
-use crate::source::SourceMeta;
+use crate::source::SourceItem;
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 #[derive(Debug, Default)]
 pub struct PipelineOutput {
@@ -26,7 +27,7 @@ pub struct FileCount {
 pub fn run(
     config: &Config,
     registry: &LanguageRegistry,
-    sources: Vec<SourceMeta>,
+    sources: Vec<SourceItem>,
 ) -> Result<PipelineOutput> {
     let files_found = sources.len();
     let mut backend = io_backend::create(config.io_backend)?;
@@ -35,51 +36,29 @@ pub fn run(
     let mut languages = BTreeMap::new();
     let mut files = Vec::new();
 
-    for source in sources {
-        let bytes = backend.read(&source)?;
-        if is_binary(&bytes) {
-            continue;
+    let requests = sources
+        .into_iter()
+        .map(|item| ReadRequest { item })
+        .collect();
+    let mut first_error = None;
+    backend.read_many(requests, &mut |read_result| {
+        if first_error.is_some() {
+            return;
         }
+        if let Err(err) = process_read_file(
+            config,
+            registry,
+            &counters,
+            &mut languages,
+            &mut files,
+            read_result,
+        ) {
+            first_error = Some(err);
+        }
+    })?;
 
-        let text = String::from_utf8_lossy(&bytes);
-        if let Some(pattern) = &config.include_content
-            && !pattern.is_match(&text)
-        {
-            continue;
-        }
-        if let Some(pattern) = &config.exclude_content
-            && pattern.is_match(&text)
-        {
-            continue;
-        }
-
-        let first_line = text.lines().next();
-        let Some(language) = registry.detect(&source.path, first_line) else {
-            continue;
-        };
-
-        if !config.include_lang.is_empty()
-            && !config.include_lang.contains(language.normalized_name)
-        {
-            continue;
-        }
-        if config.exclude_lang.contains(language.normalized_name) {
-            continue;
-        }
-
-        let counts = counters.count(language, &bytes);
-        languages
-            .entry(language.name.to_string())
-            .or_insert_with(LineCounts::default)
-            .add_assign(counts);
-
-        if config.by_file {
-            files.push(FileCount {
-                path: source.logical_path,
-                language: language.name.to_string(),
-                counts,
-            });
-        }
+    if let Some(err) = first_error {
+        return Err(err);
     }
 
     let files_counted = languages.values().map(|counts| counts.files as usize).sum();
@@ -93,6 +72,61 @@ pub fn run(
     })
 }
 
+fn process_read_file(
+    config: &Config,
+    registry: &LanguageRegistry,
+    counters: &CounterSet,
+    languages: &mut BTreeMap<String, LineCounts>,
+    files: &mut Vec<FileCount>,
+    read_result: Result<ReadFile>,
+) -> Result<()> {
+    let read_file = read_result?;
+    if is_binary(&read_file.bytes) {
+        return Ok(());
+    }
+
+    let text = String::from_utf8_lossy(&read_file.bytes);
+    if let Some(pattern) = &config.include_content
+        && !pattern.is_match(&text)
+    {
+        return Ok(());
+    }
+    if let Some(pattern) = &config.exclude_content
+        && pattern.is_match(&text)
+    {
+        return Ok(());
+    }
+
+    let first_line = text.lines().next();
+    let logical_path = Path::new(&read_file.item.logical_path);
+    let Some(language) = registry.detect(logical_path, first_line) else {
+        return Ok(());
+    };
+
+    if !config.include_lang.is_empty() && !config.include_lang.contains(language.normalized_name) {
+        return Ok(());
+    }
+    if config.exclude_lang.contains(language.normalized_name) {
+        return Ok(());
+    }
+
+    let counts = counters.count(language, &read_file.bytes);
+    languages
+        .entry(language.name.to_string())
+        .or_insert_with(LineCounts::default)
+        .add_assign(counts);
+
+    if config.by_file {
+        files.push(FileCount {
+            path: read_file.item.logical_path,
+            language: language.name.to_string(),
+            counts,
+        });
+    }
+
+    Ok(())
+}
+
 fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|byte| *byte == 0)
 }
@@ -101,25 +135,33 @@ fn is_binary(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::config::IoBackendKind;
-    use crate::source::SourceMeta;
+    use crate::source::{SourceItem, SourceRef};
     use regex::Regex;
     use std::collections::BTreeSet;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn temp_file(name: &str, contents: &str) -> (std::path::PathBuf, SourceMeta) {
+    fn temp_file(name: &str, contents: &str) -> (std::path::PathBuf, SourceItem) {
+        temp_source(name, name, contents)
+    }
+
+    fn temp_source(
+        logical_path: &str,
+        disk_name: &str,
+        contents: &str,
+    ) -> (std::path::PathBuf, SourceItem) {
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let root = std::env::temp_dir().join(format!("dloc-pipeline-test-{id}"));
         fs::create_dir_all(&root).unwrap();
-        let path = root.join(name);
+        let path = root.join(disk_name);
         fs::write(&path, contents).unwrap();
-        let source = SourceMeta {
-            logical_path: path.to_string_lossy().into_owned(),
-            path,
+        let source = SourceItem {
+            logical_path: logical_path.to_string(),
             size: contents.len() as u64,
+            source: SourceRef::Path(path),
         };
         (root, source)
     }
@@ -162,6 +204,17 @@ mod tests {
             })
         );
         assert_eq!(output.files.len(), 1);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_language_from_logical_path() {
+        let (root, source) = temp_source("src/lib.rs", "blob-without-extension", "fn main() {}\n");
+        let output = run(&test_config(), &LanguageRegistry::new(), vec![source]).unwrap();
+
+        assert_eq!(output.files_counted, 1);
+        assert!(output.languages.contains_key("Rust"));
 
         fs::remove_dir_all(root).unwrap();
     }

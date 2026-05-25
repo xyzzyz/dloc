@@ -6,10 +6,23 @@ use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SourceMeta {
-    pub path: PathBuf,
+pub struct SourceItem {
     pub logical_path: String,
     pub size: u64,
+    pub source: SourceRef,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum SourceRef {
+    Path(PathBuf),
+}
+
+impl SourceRef {
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Path(path) => Some(path),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -20,7 +33,7 @@ impl FileSystemProvider {
         Self
     }
 
-    pub fn enumerate(&self, config: &Config) -> Result<Vec<SourceMeta>> {
+    pub fn enumerate(&self, config: &Config) -> Result<Vec<SourceItem>> {
         let mut sources = Vec::new();
         let mut visited_dirs = BTreeSet::new();
 
@@ -38,7 +51,7 @@ impl FileSystemProvider {
         config: &Config,
         explicit: bool,
         visited_dirs: &mut BTreeSet<PathBuf>,
-        sources: &mut Vec<SourceMeta>,
+        sources: &mut Vec<SourceItem>,
     ) -> Result<()> {
         let metadata = fs::symlink_metadata(path).map_err(|err| DlocError::io_path(path, err))?;
 
@@ -63,7 +76,7 @@ impl FileSystemProvider {
         config: &Config,
         explicit: bool,
         visited_dirs: &mut BTreeSet<PathBuf>,
-        sources: &mut Vec<SourceMeta>,
+        sources: &mut Vec<SourceItem>,
     ) -> Result<()> {
         let metadata = fs::metadata(path).map_err(|err| DlocError::io_path(path, err))?;
 
@@ -81,7 +94,7 @@ impl FileSystemProvider {
         path: &Path,
         config: &Config,
         visited_dirs: &mut BTreeSet<PathBuf>,
-        sources: &mut Vec<SourceMeta>,
+        sources: &mut Vec<SourceItem>,
     ) -> Result<()> {
         if let Some(name) = path.file_name().and_then(|name| name.to_str())
             && is_always_excluded_dir(name)
@@ -144,7 +157,7 @@ impl FileSystemProvider {
         config: &Config,
         explicit: bool,
         metadata: &Metadata,
-        sources: &mut Vec<SourceMeta>,
+        sources: &mut Vec<SourceItem>,
     ) {
         if !explicit && metadata.len() > config.max_file_size_bytes {
             return;
@@ -158,10 +171,10 @@ impl FileSystemProvider {
             return;
         }
 
-        sources.push(SourceMeta {
-            path: path.to_path_buf(),
+        sources.push(SourceItem {
             logical_path: path.to_string_lossy().into_owned(),
             size: metadata.len(),
+            source: SourceRef::Path(path.to_path_buf()),
         });
     }
 }
