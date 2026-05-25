@@ -33,17 +33,19 @@ pub fn run(
     sources: Vec<SourceItem>,
 ) -> Result<PipelineOutput> {
     let files_found = sources.len();
-    let backend_name = io_backend::name(config.io_backend)?.to_string();
 
     if sources.is_empty() {
         return Ok(PipelineOutput {
-            backend: backend_name,
+            backend: io_backend::name(config.io_backend)?.to_string(),
             files_found,
             files_counted: 0,
             languages: BTreeMap::new(),
             files: Vec::new(),
         });
     }
+
+    let backend_selection = io_backend::select(config.io_backend)?;
+    let backend_name = backend_selection.name().to_string();
 
     let worker_count = config.threads.max(1);
     // Keep bounded queues large enough to absorb short producer/consumer bursts
@@ -62,9 +64,8 @@ pub fn run(
     for _ in 0..io_workers {
         let request_rx = request_rx.clone();
         let read_tx = read_tx.clone();
-        let config = Arc::clone(&config);
         handles.push(thread::spawn(move || {
-            run_io_worker(config, request_rx, read_tx)
+            run_io_worker(backend_selection, request_rx, read_tx)
         }));
     }
     drop(read_tx);
@@ -129,11 +130,11 @@ pub fn run(
 }
 
 fn run_io_worker(
-    config: Arc<Config>,
+    backend_selection: io_backend::BackendSelection,
     request_rx: Receiver<ReadRequest>,
     read_tx: Sender<Result<ReadFile>>,
 ) -> Result<()> {
-    let mut backend = io_backend::create(config.io_backend)?;
+    let mut backend = io_backend::create_selected(backend_selection)?;
     while let Ok(first) = request_rx.recv() {
         let mut batch = vec![first];
         while batch.len() < READ_BATCH_SIZE {
@@ -422,5 +423,16 @@ mod tests {
         assert_eq!(output.languages.get("Rust").unwrap().files, 64);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_sources_do_not_initialize_backend() {
+        let mut config = test_config();
+        config.io_backend = IoBackendKind::Uring;
+        let output = run(&config, &LanguageRegistry::new(), Vec::new()).unwrap();
+
+        assert_eq!(output.backend, "io_uring");
+        assert_eq!(output.files_found, 0);
+        assert_eq!(output.files_counted, 0);
     }
 }
