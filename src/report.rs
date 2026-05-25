@@ -1,7 +1,7 @@
+use crate::Result;
 use crate::config::Config;
 use crate::count::LineCounts;
 use crate::pipeline::PipelineOutput;
-use crate::Result;
 use serde::Serialize;
 use std::io::{self, Write};
 

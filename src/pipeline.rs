@@ -1,7 +1,7 @@
+use crate::Result;
 use crate::config::Config;
 use crate::lang::LanguageRegistry;
 use crate::source::SourceMeta;
-use crate::Result;
 
 #[derive(Debug, Default)]
 pub struct PipelineOutput {
