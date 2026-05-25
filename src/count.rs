@@ -1,6 +1,6 @@
 use crate::Result;
 use crate::lang::{CommentSyntax, Language};
-use regex::Regex;
+use memchr::{memchr, memmem};
 use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -20,29 +20,22 @@ impl LineCounts {
     }
 }
 
-#[derive(Debug)]
-pub struct CounterSet {
-    slash_line: Regex,
-    hash_line: Regex,
-}
+#[derive(Debug, Default)]
+pub struct CounterSet;
 
 impl CounterSet {
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            slash_line: Regex::new(r"^\s*//")?,
-            hash_line: Regex::new(r"^\s*#")?,
-        })
+        Ok(Self)
     }
 
     pub fn count(&self, language: &Language, bytes: &[u8]) -> LineCounts {
-        let text = String::from_utf8_lossy(bytes);
         let mut state = CountState::default();
         let mut counts = LineCounts {
             files: 1,
             ..LineCounts::default()
         };
 
-        for line in text.lines() {
+        for line in ByteLines::new(bytes) {
             match self.classify_line(language.syntax, line, &mut state) {
                 LineKind::Blank => counts.blank += 1,
                 LineKind::Comment => counts.comment += 1,
@@ -53,8 +46,13 @@ impl CounterSet {
         counts
     }
 
-    fn classify_line(&self, syntax: CommentSyntax, line: &str, state: &mut CountState) -> LineKind {
-        if line.trim().is_empty() {
+    fn classify_line(
+        &self,
+        syntax: CommentSyntax,
+        line: &[u8],
+        state: &mut CountState,
+    ) -> LineKind {
+        if is_blank(line) {
             return if state.block_end.is_some() {
                 LineKind::Comment
             } else if state.code_string_end.is_some() {
@@ -88,8 +86,8 @@ impl CounterSet {
         }
     }
 
-    fn classify_line_comment(&self, line: &str, marker: &str) -> LineKind {
-        if self.line_comment_regex(marker).is_match(line) {
+    fn classify_line_comment(&self, line: &[u8], marker: &str) -> LineKind {
+        if trim_start(line).starts_with(marker.as_bytes()) {
             LineKind::Comment
         } else {
             LineKind::Code
@@ -98,25 +96,30 @@ impl CounterSet {
 
     fn classify_line_and_block(
         &self,
-        line: &str,
+        line: &[u8],
         state: &mut CountState,
         marker: &str,
         block_start: &'static str,
         block_end: &'static str,
     ) -> LineKind {
-        let trimmed = line.trim_start();
-        if self.line_comment_regex(marker).is_match(line) {
+        let trimmed = trim_start(line);
+        if trimmed.starts_with(marker.as_bytes()) {
             return LineKind::Comment;
         }
 
-        let line_comment = line.find(marker);
-        let block_comment = line.find(block_start);
-        match earliest_comment(line_comment, block_comment) {
-            Some(CommentStart::Line(position)) if line[..position].trim().is_empty() => {
-                LineKind::Comment
-            }
+        let comment = if marker == "//" && block_start == "/*" {
+            find_slash_comment(line)
+        } else {
+            earliest_comment(
+                find_subslice(line, marker.as_bytes()),
+                find_subslice(line, block_start.as_bytes()),
+            )
+        };
+
+        match comment {
+            Some(CommentStart::Line(position)) if is_blank(&line[..position]) => LineKind::Comment,
             Some(CommentStart::Line(_)) => LineKind::Code,
-            Some(CommentStart::Block(position)) if line[..position].trim().is_empty() => {
+            Some(CommentStart::Block(position)) if is_blank(&line[..position]) => {
                 classify_block(trimmed, state, block_start, block_end)
             }
             Some(CommentStart::Block(_)) => LineKind::Code,
@@ -124,41 +127,27 @@ impl CounterSet {
         }
     }
 
-    fn classify_python(&self, line: &str, state: &mut CountState) -> LineKind {
-        if self.hash_line.is_match(line) {
+    fn classify_python(&self, line: &[u8], state: &mut CountState) -> LineKind {
+        if trim_start(line).starts_with(b"#") {
             return LineKind::Comment;
         }
 
-        let trimmed = line.trim_start();
-        let single = trimmed.find("'''");
-        let double = trimmed.find("\"\"\"");
+        let trimmed = trim_start(line);
+        let single = find_subslice(trimmed, b"'''");
+        let double = find_subslice(trimmed, b"\"\"\"");
         match earliest_python_block(single, double) {
-            Some((position, token)) if trimmed[..position].trim().is_empty() => {
+            Some((position, token)) if is_blank(&trimmed[..position]) => {
                 classify_block(trimmed, state, token, token)
             }
             Some((position, token)) => {
                 let after_start = position + token.len();
-                if !trimmed[after_start..].contains(token) {
+                if find_subslice(&trimmed[after_start..], token.as_bytes()).is_none() {
                     state.code_string_end = Some(token);
                 }
                 LineKind::Code
             }
             None => LineKind::Code,
         }
-    }
-
-    fn line_comment_regex(&self, marker: &str) -> &Regex {
-        match marker {
-            "#" => &self.hash_line,
-            "//" => &self.slash_line,
-            _ => &self.hash_line,
-        }
-    }
-}
-
-impl Default for CounterSet {
-    fn default() -> Self {
-        Self::new().expect("built-in counter regexes must compile")
     }
 }
 
@@ -182,23 +171,25 @@ enum CommentStart {
 }
 
 fn classify_block(
-    line: &str,
+    line: &[u8],
     state: &mut CountState,
     block_start: &'static str,
     block_end: &'static str,
 ) -> LineKind {
-    let Some(start) = line.find(block_start) else {
+    let block_start = block_start.as_bytes();
+    let block_end_bytes = block_end.as_bytes();
+    let Some(start) = find_subslice(line, block_start) else {
         return LineKind::Code;
     };
 
-    if !line[..start].trim().is_empty() {
+    if !is_blank(&line[..start]) {
         return LineKind::Code;
     }
 
     let after_start = start + block_start.len();
-    if let Some(end) = line[after_start..].find(block_end) {
-        let after_end = after_start + end + block_end.len();
-        if line[after_end..].trim().is_empty() {
+    if let Some(end) = find_subslice(&line[after_start..], block_end_bytes) {
+        let after_end = after_start + end + block_end_bytes.len();
+        if is_blank(&line[after_end..]) {
             LineKind::Comment
         } else {
             LineKind::Code
@@ -209,11 +200,11 @@ fn classify_block(
     }
 }
 
-fn finish_block_line(line: &str, state: &mut CountState, block_end: &'static str) -> LineKind {
-    if let Some(end) = line.find(block_end) {
+fn finish_block_line(line: &[u8], state: &mut CountState, block_end: &'static str) -> LineKind {
+    if let Some(end) = find_subslice(line, block_end.as_bytes()) {
         state.block_end = None;
         let after_end = end + block_end.len();
-        if line[after_end..].trim().is_empty() {
+        if is_blank(&line[after_end..]) {
             LineKind::Comment
         } else {
             LineKind::Code
@@ -224,11 +215,11 @@ fn finish_block_line(line: &str, state: &mut CountState, block_end: &'static str
 }
 
 fn finish_code_string_line(
-    line: &str,
+    line: &[u8],
     state: &mut CountState,
     string_end: &'static str,
 ) -> LineKind {
-    if line.contains(string_end) {
+    if find_subslice(line, string_end.as_bytes()).is_some() {
         state.code_string_end = None;
     }
     LineKind::Code
@@ -243,6 +234,102 @@ fn earliest_comment(line: Option<usize>, block: Option<usize>) -> Option<Comment
         (None, Some(block)) => Some(CommentStart::Block(block)),
         (None, None) => None,
     }
+}
+
+struct ByteLines<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> ByteLines<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { remaining: bytes }
+    }
+}
+
+impl<'a> Iterator for ByteLines<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.remaining.is_empty() {
+            return None;
+        }
+
+        match memchr(b'\n', self.remaining) {
+            Some(position) => {
+                let line = &self.remaining[..position];
+                self.remaining = &self.remaining[position + 1..];
+                Some(line)
+            }
+            None => {
+                let line = self.remaining;
+                self.remaining = &[];
+                Some(line)
+            }
+        }
+    }
+}
+
+fn is_blank(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| byte.is_ascii_whitespace())
+}
+
+fn trim_start(bytes: &[u8]) -> &[u8] {
+    let start = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    &bytes[start..]
+}
+
+#[inline]
+fn find_slash_comment(line: &[u8]) -> Option<CommentStart> {
+    let mut offset = 0;
+    while let Some(position) = memchr(b'/', &line[offset..]) {
+        let index = offset + position;
+        match line.get(index + 1) {
+            Some(b'/') => return Some(CommentStart::Line(index)),
+            Some(b'*') => return Some(CommentStart::Block(index)),
+            _ => offset = index + 1,
+        }
+    }
+    None
+}
+
+#[inline]
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    match needle.len() {
+        0 => Some(0),
+        1 => memchr(needle[0], haystack),
+        2 => find_pair(haystack, needle[0], needle[1]),
+        3 => find_triple(haystack, needle[0], needle[1], needle[2]),
+        _ => memmem::find(haystack, needle),
+    }
+}
+
+#[inline]
+fn find_pair(haystack: &[u8], first: u8, second: u8) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(position) = memchr(first, &haystack[offset..]) {
+        let index = offset + position;
+        if haystack.get(index + 1) == Some(&second) {
+            return Some(index);
+        }
+        offset = index + 1;
+    }
+    None
+}
+
+#[inline]
+fn find_triple(haystack: &[u8], first: u8, second: u8, third: u8) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(position) = memchr(first, &haystack[offset..]) {
+        let index = offset + position;
+        if haystack.get(index + 1) == Some(&second) && haystack.get(index + 2) == Some(&third) {
+            return Some(index);
+        }
+        offset = index + 1;
+    }
+    None
 }
 
 fn earliest_python_block(

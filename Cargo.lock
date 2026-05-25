@@ -142,6 +142,7 @@ dependencies = [
  "crossbeam-channel",
  "io-uring",
  "libc",
+ "memchr",
  "regex",
  "serde",
  "serde_json",

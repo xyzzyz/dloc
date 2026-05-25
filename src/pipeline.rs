@@ -6,6 +6,7 @@ use crate::lang::LanguageRegistry;
 use crate::source::SourceItem;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::Serialize;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -49,7 +50,7 @@ pub fn run(
 
     let worker_count = config.threads.max(1);
     let io_workers = backend_selection.io_worker_count(worker_count, files_found);
-    let cpu_workers = worker_count;
+    let cpu_workers = backend_selection.count_worker_count(worker_count);
     // Give IO workers enough queued paths to form full read batches while keeping
     // read-result buffers under tighter backpressure.
     let request_channel_bound = request_channel_bound(io_workers);
@@ -225,22 +226,32 @@ fn count_read_file(
         return Ok(None);
     }
 
-    let text = String::from_utf8_lossy(&read_file.bytes);
+    let needs_text = config.include_content.is_some() || config.exclude_content.is_some();
+    let text = needs_text.then(|| String::from_utf8_lossy(&read_file.bytes));
+
     if let Some(pattern) = &config.include_content
-        && !pattern.is_match(&text)
+        && !pattern.is_match(text.as_ref().expect("content filter needs text"))
     {
         return Ok(None);
     }
     if let Some(pattern) = &config.exclude_content
-        && pattern.is_match(&text)
+        && pattern.is_match(text.as_ref().expect("content filter needs text"))
     {
         return Ok(None);
     }
 
-    let first_line = text.lines().next();
     let logical_path = Path::new(&read_file.item.logical_path);
-    let Some(language) = registry.detect(logical_path, first_line) else {
-        return Ok(None);
+    let language = if let Some(language) = registry.detect_path(logical_path) {
+        language
+    } else {
+        let first_line = match &text {
+            Some(text) => text.lines().next().map(Cow::Borrowed),
+            None => first_line_utf8_lossy(&read_file.bytes),
+        };
+        let Some(language) = registry.detect(logical_path, first_line.as_deref()) else {
+            return Ok(None);
+        };
+        language
     };
 
     if !config.include_lang.is_empty() && !config.include_lang.contains(language.normalized_name) {
@@ -270,6 +281,23 @@ fn count_read_file(
 
 fn is_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8192).any(|byte| *byte == 0)
+}
+
+fn first_line_utf8_lossy(bytes: &[u8]) -> Option<Cow<'_, str>> {
+    if bytes.is_empty() {
+        return None;
+    }
+
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(bytes.len());
+    let line = if end > 0 && bytes[end - 1] == b'\r' {
+        &bytes[..end - 1]
+    } else {
+        &bytes[..end]
+    };
+    Some(String::from_utf8_lossy(line))
 }
 
 fn request_channel_bound(worker_count: usize) -> usize {
@@ -383,6 +411,33 @@ mod tests {
         assert!(output.languages.contains_key("Rust"));
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn detects_language_from_shebang_without_full_text_decode() {
+        let (root, source) = temp_source("script", "script", "#!/usr/bin/env python\nprint(1)\n");
+        let output = run(&test_config(), &LanguageRegistry::new(), vec![source]).unwrap();
+
+        assert_eq!(output.files_counted, 1);
+        assert!(output.languages.contains_key("Python"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn include_content_filter_still_matches_text() {
+        let (root_a, source_a) = temp_source("keep.rs", "keep", "fn keep() {}\n");
+        let (root_b, source_b) = temp_source("skip.rs", "skip", "fn skip() {}\n");
+        let mut config = test_config();
+        config.include_content = Some(Regex::new("keep").unwrap());
+
+        let output = run(&config, &LanguageRegistry::new(), vec![source_a, source_b]).unwrap();
+
+        assert_eq!(output.files_counted, 1);
+        assert_eq!(output.languages.get("Rust").unwrap().files, 1);
+
+        fs::remove_dir_all(root_a).unwrap();
+        fs::remove_dir_all(root_b).unwrap();
     }
 
     #[test]

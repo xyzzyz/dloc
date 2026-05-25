@@ -52,6 +52,14 @@ impl BackendSelection {
         };
         worker_count.max(1).min(files_found.max(1))
     }
+
+    pub fn count_worker_count(self, worker_count: usize) -> usize {
+        match self.kind {
+            SelectedBackendKind::Pread => worker_count,
+            SelectedBackendKind::Uring => worker_count.min(MAX_URING_COUNT_WORKERS),
+        }
+        .max(1)
+    }
 }
 
 pub fn create(kind: IoBackendKind) -> Result<Box<dyn ReadBackend>> {
@@ -736,6 +744,7 @@ const IORING_FILE_BATCH_SIZE: usize = IORING_QUEUE_DEPTH / 2;
 const IORING_COMPLETION_WAIT_BATCH: usize = IORING_FILE_BATCH_SIZE;
 const IORING_MAX_IN_FLIGHT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_URING_IO_WORKERS: usize = 2;
+const MAX_URING_COUNT_WORKERS: usize = 12;
 const URING_FD_RESERVE: usize = 128;
 const URING_OPERATION_BITS: u64 = 2;
 const URING_OPERATION_MASK: u64 = (1 << URING_OPERATION_BITS) - 1;
